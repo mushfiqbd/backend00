@@ -775,14 +775,13 @@ export async function processWebhook(rawBody: unknown, contentType: string | und
   const providedSecret = payload.passphrase || payload.secret;
   const envSecret = String(process.env.WEBHOOK_PASSPHRASE ?? '').trim();
   if (envSecret && providedSecret !== envSecret) {
-    logger.warn('Webhook rejected: env passphrase mismatch', {
+    logger.warn('Webhook env passphrase mismatch; falling back to DB secret validation', {
       hasProvidedSecret: Boolean(providedSecret),
       envSecretConfigured: Boolean(envSecret),
       providedLength: String(providedSecret ?? '').trim().length,
       envLength: envSecret.length,
       timestamp: new Date().toISOString(),
     });
-    return { status: 401, body: { error: 'Invalid passphrase' } };
   }
   const validationError = validatePayloadStrict(payload);
   if (validationError && !payload.dry_run) {
