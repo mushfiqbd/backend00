@@ -262,6 +262,15 @@ function floorToStep(value: number, step: number): number {
   return Number(out.toFixed(8));
 }
 
+function decimalsFromStep(step: number): number {
+  if (!Number.isFinite(step) || step <= 0) return 8;
+  const s = step.toString();
+  const idx = s.indexOf('.');
+  if (idx === -1) return 0;
+  const decimals = s.length - idx - 1;
+  return decimals >= 0 && decimals <= 8 ? decimals : 8;
+}
+
 async function getBinanceQtyConstraints(
   mode: Mode,
   symbol: string,
@@ -332,7 +341,8 @@ async function normalizeOrderQuantity(
     if (enforceMin && normalized < constraints.minQty) {
       normalized = constraints.minQty;
     }
-    return Number(normalized.toFixed(8));
+    const decimals = decimalsFromStep(constraints.stepQty);
+    return Number(normalized.toFixed(decimals));
   } catch {
     const fallback = normalizeQty(qty);
     if (enforceMin && fallback <= 0) return 0.001;
