@@ -207,6 +207,59 @@ async function resolveUserFromWebhookSecret(payload: NormalizedPayload): Promise
   };
 }
 
+async function resolveUserFromPayloadIdentity(
+  payload: NormalizedPayload,
+): Promise<{ userId: string; mode: Mode } | null> {
+  const userIdRaw = String(payload.user_id ?? payload.userId ?? '').trim();
+  const emailRaw = String(payload.email ?? '').trim().toLowerCase();
+
+  if (userIdRaw) {
+    const byId = await pool.query(
+      `SELECT user_id, trading_mode
+       FROM app_settings
+       WHERE user_id = $1::uuid
+       LIMIT 1`,
+      [userIdRaw],
+    );
+    if (byId.rows.length) {
+      return {
+        userId: String(byId.rows[0].user_id),
+        mode: String(byId.rows[0].trading_mode) === 'real' ? 'real' : 'demo',
+      };
+    }
+  }
+
+  if (emailRaw) {
+    const byEmail = await pool.query(
+      `SELECT a.user_id, a.trading_mode
+       FROM app_settings a
+       JOIN users u ON u.id = a.user_id
+       WHERE lower(u.email) = $1
+       LIMIT 1`,
+      [emailRaw],
+    );
+    if (byEmail.rows.length) {
+      return {
+        userId: String(byEmail.rows[0].user_id),
+        mode: String(byEmail.rows[0].trading_mode) === 'real' ? 'real' : 'demo',
+      };
+    }
+  }
+
+  return null;
+}
+
+async function upsertWebhookSecretForUser(userId: string, secret: string): Promise<void> {
+  const trimmed = String(secret || '').trim();
+  if (!trimmed) return;
+  await pool.query(
+    `UPDATE app_settings
+     SET webhook_secret = $2, updated_at = NOW()
+     WHERE user_id = $1::uuid`,
+    [userId, trimmed],
+  );
+}
+
 async function isDuplicateEvent(userId: string, eventId: string): Promise<boolean> {
   const result = await pool.query(
     'SELECT id FROM webhook_events WHERE user_id = $1 AND event_id = $2 LIMIT 1',
@@ -812,7 +865,21 @@ export async function processWebhook(rawBody: unknown, contentType: string | und
     };
   }
 
-  const user = await resolveUserFromWebhookSecret(payload);
+  let user = await resolveUserFromWebhookSecret(payload);
+  if (!user && providedSecret) {
+    const identified = await resolveUserFromPayloadIdentity(payload);
+    if (identified) {
+      await upsertWebhookSecretForUser(identified.userId, providedSecret);
+      user = identified;
+      logger.info('Webhook secret auto-synced from payload for identified user', {
+        userId: identified.userId,
+        mode: identified.mode,
+        usedIdentity: payload.user_id || payload.userId ? 'user_id' : payload.email ? 'email' : 'unknown',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
   if (!user) {
     logger.warn('Webhook rejected: DB webhook_secret not matched', {
       hasProvidedSecret: Boolean(providedSecret),
