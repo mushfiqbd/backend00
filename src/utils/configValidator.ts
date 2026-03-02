@@ -58,12 +58,7 @@ export function validateConfig(): Config {
     throw new Error('RATE_LIMIT_MAX_REQUESTS must be a positive number');
   }
 
-  if ((process.env.NODE_ENV || 'development') === 'production') {
-    const webhookPassphrase = String(process.env.WEBHOOK_PASSPHRASE || '');
-    if (!webhookPassphrase.trim()) {
-      throw new Error('WEBHOOK_PASSPHRASE is required in production');
-    }
-  }
+  // WEBHOOK_PASSPHRASE is optional in production; DB webhook_secret can be used.
 
   const pendingEntryTimeoutSec = parseInt(process.env.PENDING_ENTRY_TIMEOUT_SEC || '90', 10);
   if (isNaN(pendingEntryTimeoutSec) || pendingEntryTimeoutSec < 5) {
