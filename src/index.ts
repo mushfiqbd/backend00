@@ -38,6 +38,9 @@ const envConfig = process.env.NODE_ENV === 'production' ? productionConfig : dev
 const app = express();
 const PORT = config.port;
 
+// Respect reverse proxies (Koyeb/Render/etc.) for correct client IP handling.
+app.set('trust proxy', envConfig.app.trustProxy ? 1 : false);
+
 // Rate limiting
 const limiter = rateLimit({
   windowMs: envConfig.security.rateLimit.windowMs,
