@@ -56,12 +56,40 @@ const TP_FRACTIONS: Record<string, number> = {
 
 function normalizeSymbol(symbol: unknown): string | undefined {
   if (symbol == null) return undefined;
-  const s = String(symbol).trim().toUpperCase();
+  let s = String(symbol).trim().toUpperCase();
   if (!s) return undefined;
+  s = s.replace(/^(BINANCE|BYBIT):/, '');
+  s = s.replace(/\.P$/i, '');
+  s = s.replace(/PERP$/i, '');
   return s.replace(/[^A-Z0-9]/g, '');
 }
 
+function tryParseEmbeddedJson(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const candidates: string[] = [trimmed];
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Keep trying fallback candidates.
+    }
+  }
+  return null;
+}
+
 function parseTextPayload(text: string): Record<string, unknown> {
+  const embeddedJson = tryParseEmbeddedJson(text);
+  if (embeddedJson) return embeddedJson;
+
   const out: Record<string, unknown> = {};
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -103,17 +131,19 @@ export function normalizeWebhookPayload(input: unknown): NormalizedPayload {
   const merged = { ...kvFromRaw, ...src };
   const eventTypeRaw = String(merged.event_type ?? merged.signal ?? merged.action ?? '').trim().toUpperCase();
   const sideRaw = String(merged.side ?? '').trim().toLowerCase();
-  const eventId = String(merged.event_id ?? merged.id ?? '').trim();
+  const eventId = String(merged.event_id ?? merged.id ?? merged.alert_id ?? '').trim();
+  const eventTypeNormalized = normalizeLegacyEventType(eventTypeRaw, sideRaw);
+  const fallbackEventId = `tv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   return {
     ...merged,
     passphrase: merged.passphrase ? String(merged.passphrase) : undefined,
     secret: merged.secret ? String(merged.secret) : undefined,
-    event_id: eventId,
-    event_type: eventTypeRaw || 'UNKNOWN',
-    symbol: normalizeSymbol(merged.symbol),
+    event_id: eventId || fallbackEventId,
+    event_type: eventTypeNormalized,
+    symbol: normalizeSymbol(merged.symbol ?? merged.ticker ?? merged.pair),
     side: sideRaw || undefined,
-    strategy_id: merged.strategy_id ? String(merged.strategy_id) : undefined,
+    strategy_id: merged.strategy_id ? String(merged.strategy_id) : merged.strategyId ? String(merged.strategyId) : undefined,
     quantity: toNumberOrUndefined(merged.quantity ?? merged.qty),
     price: toNumberOrUndefined(merged.price),
     stop_loss: toNumberOrUndefined(merged.stop_loss ?? merged.stopLoss ?? merged.sl),
@@ -138,6 +168,26 @@ export function normalizeWebhookPayload(input: unknown): NormalizedPayload {
           ? true
           : undefined,
   };
+}
+
+function normalizeLegacyEventType(eventTypeRaw: string, sideRaw: string): string {
+  const normalized = eventTypeRaw.replace(/[\s-]+/g, '_');
+  if (ALLOWED_EVENT_TYPES.has(normalized)) return normalized;
+
+  if (normalized === 'ENTRY' || normalized === 'OPEN') {
+    if (sideRaw === 'sell' || sideRaw === 'short') return 'SHORT_ENTRY';
+    return 'LONG_ENTRY';
+  }
+  if (normalized === 'BUY' || normalized === 'LONG' || normalized === 'LONG_ENTRY_SIGNAL') return 'LONG_ENTRY';
+  if (normalized === 'SELL' || normalized === 'SHORT' || normalized === 'SHORT_ENTRY_SIGNAL') return 'SHORT_ENTRY';
+  if (normalized === 'EXIT' || normalized === 'CLOSE_ALL' || normalized === 'FLAT') return 'CLOSE';
+  if (normalized === 'SL' || normalized === 'STOP_LOSS' || normalized === 'STOPLOSS') return 'STOP';
+
+  const tpMatch = /^TP_?([1-5])(?:_HIT)?$/.exec(normalized);
+  if (tpMatch) return `TP${tpMatch[1]}_HIT`;
+  if (normalized === 'TAKE_PROFIT') return 'TP1_HIT';
+
+  return normalized || 'UNKNOWN';
 }
 
 async function resolveUserFromWebhookSecret(payload: NormalizedPayload): Promise<{ userId: string; mode: Mode } | null> {
@@ -451,16 +501,11 @@ async function drainQueuedActionsForPosition(
   return replayDetails;
 }
 
-function validatePayloadStrict(source: Record<string, unknown>, payload: NormalizedPayload): string | null {
+function validatePayloadStrict(payload: NormalizedPayload): string | null {
   if (!payload.event_id) return 'event_id is required';
-  if (!payload.event_type) return 'event_type is required';
-  if (!payload.strategy_id || !payload.strategy_id.trim()) return 'strategy_id is required';
+  if (!payload.event_type || payload.event_type === 'UNKNOWN') return 'event_type is required';
   if (!ALLOWED_EVENT_TYPES.has(payload.event_type)) return `Unsupported event_type: ${payload.event_type}`;
-  const rawSymbol = String(source.symbol ?? '').trim().toUpperCase();
-  if (!rawSymbol) return 'symbol is required';
-  if (!/^[A-Z0-9]{5,20}$/.test(rawSymbol)) return 'Invalid symbol format (expected like BTCUSDT)';
-  if (!payload.symbol || !/^[A-Z0-9]{5,20}$/.test(payload.symbol)) return 'Invalid normalized symbol';
-  if (rawSymbol !== payload.symbol) return 'Symbol format mismatch (use BTCUSDT style)';
+  if (!payload.symbol || !/^[A-Z0-9]{5,30}$/.test(payload.symbol)) return 'Invalid symbol format (expected like BTCUSDT)';
   if (payload.event_type === 'SL_UPDATE') {
     const slPrice = payload.stop_loss ?? payload.sl_price ?? payload.price;
     if (!Number.isFinite(Number(slPrice ?? NaN)) || Number(slPrice) <= 0) {
@@ -715,7 +760,7 @@ async function executeExit(
 
 export async function processWebhook(rawBody: unknown, contentType: string | undefined, query: Record<string, unknown>) {
   const source =
-    typeof rawBody === 'string' && contentType && !contentType.includes('application/json')
+    typeof rawBody === 'string'
       ? parseTextPayload(rawBody)
       : (rawBody as Record<string, unknown> | null) ?? {};
 
@@ -732,8 +777,16 @@ export async function processWebhook(rawBody: unknown, contentType: string | und
   if (envSecret && providedSecret !== envSecret) {
     return { status: 401, body: { error: 'Invalid passphrase' } };
   }
-  const validationError = validatePayloadStrict(source, payload);
+  const validationError = validatePayloadStrict(payload);
   if (validationError && !payload.dry_run) {
+    logger.warn('Webhook payload validation failed', {
+      error: validationError,
+      eventType: payload.event_type,
+      symbol: payload.symbol,
+      hasPassphrase: Boolean(payload.passphrase || payload.secret),
+      contentType,
+      timestamp: new Date().toISOString(),
+    });
     return {
       status: 400,
       body: { error: 'Invalid payload', message: validationError },
